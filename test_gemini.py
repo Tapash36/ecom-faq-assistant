@@ -15,7 +15,7 @@ client = genai.Client(api_key=api_key)
 
 # Send a test prompt
 response = client.models.generate_content(
-    model="gemini-3.8-flash",
+    model="gemini-3.5-flash",
     contents="Say hello and confirm you are ready to help with our e-commerce FAQ chatbot project!"
 )
 
