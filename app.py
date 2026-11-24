@@ -7,11 +7,24 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
-from google.genai.errors import APIError
+from google.genai import types
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 api_key = os.getenv("GEMINI_API_KEY")
-SUPPORT_EMAIL = "support@store.com"
+SUPPORT_EMAIL = "teamX@gmail.com"
+FAST_MODELS = ("gemini-3.5-flash-lite", "gemini-3.5-flash")
+
+STOPWORDS = {
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had",
+    "her", "was", "one", "our", "out", "day", "get", "has", "him", "his",
+    "how", "man", "new", "now", "old", "see", "two", "way", "who", "boy",
+    "did", "its", "let", "put", "say", "she", "too", "use", "what", "when",
+    "where", "which", "why", "with", "your", "have", "from", "this", "that",
+    "will", "would", "could", "should", "about", "after", "before", "does",
+    "into", "more", "other", "some", "such", "than", "then", "them", "these",
+    "they", "very", "want", "need", "please", "help", "store", "item",
+    "items", "product", "products", "order", "orders",
+}
 
 
 def normalize_text(text):
@@ -23,18 +36,23 @@ def normalize_text(text):
     return text.strip()
 
 
-def tokenize(text):
-    return [token for token in normalize_text(text).split() if len(token) > 2]
+def tokenize(text, remove_stopwords=False):
+    tokens = [token for token in normalize_text(text).split() if len(token) > 2]
+    if remove_stopwords:
+        return [token for token in tokens if token not in STOPWORDS]
+    return tokens
 
 
 @st.cache_resource
-def get_client():
-    return genai.Client(api_key=api_key)
+def get_client(key):
+    return genai.Client(api_key=key)
 
 
 @st.cache_data
 def load_faq_knowledge():
     file_path = Path(__file__).resolve().parent / "data" / "train_expanded.json"
+    if not file_path.exists():
+        return []
     content = file_path.read_text(encoding="utf-8").strip()
 
     if not content:
@@ -46,111 +64,262 @@ def load_faq_knowledge():
         data = [json.loads(line) for line in content.splitlines() if line.strip()]
 
     cleaned = []
+    seen = set()
     for item in data:
         question = str(item.get("question", "")).strip()
         answer = str(item.get("answer", "")).strip()
+        answer = answer.replace("[email address]", SUPPORT_EMAIL)
         if question and answer:
-            cleaned.append({"question": question, "answer": answer})
+            norm_q = normalize_text(question)
+            if norm_q not in seen:
+                seen.add(norm_q)
+                q_tokens = Counter(tokenize(question, remove_stopwords=False))
+                a_tokens = Counter(tokenize(answer, remove_stopwords=False))
+                cleaned.append({
+                    "question": question,
+                    "answer": answer,
+                    "norm_q": norm_q,
+                    "norm_a": normalize_text(answer),
+                    "q_tokens": q_tokens,
+                    "a_tokens": a_tokens,
+                })
 
     return cleaned
 
 
-def retrieve_relevant_faqs(user_query, faq_entries, top_n=4):
+def retrieve_relevant_faqs(user_query, faq_entries, top_n=3):
     if not user_query or not faq_entries:
         return []
 
-    query_tokens = set(tokenize(user_query))
+    norm_query = normalize_text(user_query)
+    meaningful_tokens = set(tokenize(user_query, remove_stopwords=True))
+    all_tokens = set(tokenize(user_query, remove_stopwords=False))
+    query_tokens = meaningful_tokens or all_tokens
+
     if not query_tokens:
         return []
 
     ranked = []
     for item in faq_entries:
-        searchable_text = f"{item.get('question', '')} {item.get('answer', '')}"
-        searchable_tokens = tokenize(searchable_text)
-        token_counts = Counter(searchable_tokens)
+        norm_q = item["norm_q"]
+        norm_a = item["norm_a"]
+        q_tokens = item["q_tokens"]
+        a_tokens = item["a_tokens"]
 
         score = 0
+        matched_meaningful = 0
         for token in query_tokens:
-            score += token_counts.get(token, 0)
+            in_q = q_tokens.get(token, 0)
+            in_a = a_tokens.get(token, 0)
+            if in_q or in_a:
+                if token in meaningful_tokens:
+                    matched_meaningful += 1
+                    score += in_q * 4 + in_a * 2
+                else:
+                    score += in_q * 1 + in_a * 1
 
-        if normalize_text(user_query) in normalize_text(item.get("question", "")):
-            score += 8
-        if normalize_text(user_query) in normalize_text(item.get("answer", "")):
-            score += 3
+        if norm_query and norm_query in norm_q:
+            score += 12
+        elif norm_query and norm_query in norm_a:
+            score += 5
 
-        if score > 0:
-            ranked.append((score, item))
+        if meaningful_tokens and matched_meaningful == 0 and norm_query not in norm_q:
+            continue
+
+        if score >= 3:
+            ranked.append((score, {"question": item["question"], "answer": item["answer"]}))
 
     ranked.sort(key=lambda entry: entry[0], reverse=True)
     return [item for _, item in ranked[:top_n]]
 
 
-def get_greeting_response(user_query):
-    greetings = {
-        "hello",
-        "hello there",
-        "hi",
-        "hi there",
-        "hey",
-        "hey there",
-        "good morning",
-        "good afternoon",
-        "good evening",
+def build_fast_prompt(relevant_faqs, history, current_query):
+    if relevant_faqs:
+        faq_block = "\n".join(
+            f"- Q: {faq['question']}\n  A: {faq['answer']}"
+            for faq in relevant_faqs
+        )
+    else:
+        faq_block = "No matching store FAQ entry."
+
+    recent_turns = history[-3:-1] if len(history) > 1 else []
+    history_lines = [
+        f"{'Customer' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+        for m in recent_turns
+    ]
+    history_block = f"\nRecent context:\n" + "\n".join(history_lines) if history_lines else ""
+
+    system_instruction = (
+        "You are TeamX (TaSaHiYo) AI Support Assistant. Give a fast, smooth, warm, and concise answer (2-4 sentences).\n"
+        f"- If Store FAQs below answer the question, use those facts naturally.\n"
+        f"- If there is no matching FAQ, give a helpful Gemini-generated answer and smoothly tell the user to contact **{SUPPORT_EMAIL}** for store-specific confirmation.\n"
+        f"- For any extra, follow-up, or account-specific questions, always remind them to contact **{SUPPORT_EMAIL}**."
+    )
+
+    user_contents = (
+        f"Store FAQs:\n{faq_block}{history_block}\n\n"
+        f"Customer question: {current_query}"
+    )
+    return system_instruction, user_contents
+
+
+def stream_gemini_response(client, system_instruction, user_contents):
+    last_error = None
+    for model_name in FAST_MODELS:
+        try:
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                max_output_tokens=300,
+                thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+            )
+            return client.models.generate_content_stream(
+                model=model_name,
+                contents=user_contents,
+                config=config,
+            )
+        except Exception as err:
+            last_error = err
+            try:
+                # Fallback if thinking_level="minimal" is rejected on a specific model
+                config = types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    max_output_tokens=300,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                )
+                return client.models.generate_content_stream(
+                    model=model_name,
+                    contents=user_contents,
+                    config=config,
+                )
+            except Exception as err2:
+                last_error = err2
+                continue
+    raise last_error
+
+
+def generate_fallback_reply(user_query, relevant_faqs):
+    if relevant_faqs:
+        best = relevant_faqs[0]["answer"]
+        return (
+            f"{best}\n\n"
+            f"If you have any extra questions or need further help with your order, "
+            f"please feel free to contact us at **{SUPPORT_EMAIL}**!"
+        )
+    return (
+        "Thank you for reaching out! While I don't have a specific policy article for that exact question right now, "
+        f"our support team would be happy to help you directly. Please contact us at **{SUPPORT_EMAIL}** for any extra or other questions!"
+    )
+
+
+st.set_page_config(
+    page_title="TeamX Support Assistant",
+    page_icon="🛍️",
+    layout="centered",
+)
+
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
     }
-    if normalize_text(user_query) in greetings:
-        return "Hello! I can help with orders, shipping, returns, payments, and store policies."
-    return None
+    div.stButton > button {
+        border-radius: 20px;
+        border: 1px solid rgba(128, 128, 128, 0.25);
+        font-size: 0.88rem;
+        transition: all 0.2s ease-in-out;
+    }
+    div.stButton > button:hover {
+        border-color: #ff4b4b;
+        transform: translateY(-1px);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
+with st.sidebar:
+    st.header("🛍️ TeamX Support")
+    st.markdown(
+        "Welcome to **TeamX (TaSaHiYo)** customer care! Ask anything about orders, shipping, returns, payments, or general inquiries."
+    )
+    if api_key:
+        st.success("⚡ Gemini AI Connected (Fast Mode)", icon="✅")
+    else:
+        st.warning("⚠️ Gemini API Key Missing", icon="⚠️")
 
-def find_direct_faq(user_query, faq_entries):
-    query = normalize_text(user_query)
-    query_words = set(query.split())
-    if not query_words:
-        return None
+    st.divider()
+    st.markdown(
+        f"📧 **Need Human Support?**\n\nFor extra or account-specific questions, email us at:\n[**{SUPPORT_EMAIL}**](mailto:{SUPPORT_EMAIL})"
+    )
+    st.divider()
+    if st.button("🗑️ Clear Conversation", use_container_width=True):
+        st.session_state.messages = [
+            {
+                "role": "assistant",
+                "content": (
+                    "Hello! 👋 Welcome to **TeamX Support**. I can help you with orders, shipping, returns, payments, "
+                    f"and store policies—or answer any other questions you have. If you ever need direct assistance, you can also reach us at **{SUPPORT_EMAIL}**. How can I help you today?"
+                ),
+            }
+        ]
+        st.session_state.response_cache = {}
+        st.rerun()
 
-    for faq in faq_entries:
-        question = normalize_text(faq.get("question", ""))
-        if query == question or (
-            len(query_words) >= 3 and query_words.issubset(set(question.split()))
-        ):
-            return faq
-    return None
-
-
-st.set_page_config(page_title="SmartDesk FAQ Assistant", page_icon="🛍️")
-st.title("🛍️ TeamX(TaSaHiYo): Support Assistant")
-st.caption("AI-powered customer FAQ assistant grounded on store policies and support articles.")
+st.title("🛍️ TeamX (TaSaHiYo): AI Support Assistant")
+st.caption(
+    f"Powered by Gemini AI • Fast, smooth answers • Extra questions? Contact {SUPPORT_EMAIL}"
+)
 
 faq_entries = load_faq_knowledge()
 
 quick_questions = [
-    "Track my order",
-    "How do I return an item?",
-    "What payment methods do you accept?",
-    "How long does shipping take?",
-    "Can I cancel my order?",
+    "📦 Track my order",
+    "🔄 How do I return an item?",
+    "💳 What payment methods do you accept?",
+    "🚚 How long does shipping take?",
+    "❌ Can I cancel my order?",
+    "✉️ How can I contact customer support?",
 ]
 
 if "messages" not in st.session_state:
     st.session_state.messages = [
-        {"role": "assistant", "content": "Hello! I can help with orders, shipping, returns, payments, and store policies."}
+        {
+            "role": "assistant",
+            "content": (
+                "Hello! 👋 Welcome to **TeamX Support**. I can help you with orders, shipping, returns, payments, "
+                f"and store policies—or answer any other questions you have. If you ever need direct assistance, you can also reach us at **{SUPPORT_EMAIL}**. How can I help you today?"
+            ),
+        }
     ]
 
 if "pending_query" not in st.session_state:
     st.session_state.pending_query = None
 
+if "response_cache" not in st.session_state:
+    st.session_state.response_cache = {}
+
+st.markdown("**✨ Quick topics:**")
+cols = st.columns(3)
+for idx, label in enumerate(quick_questions):
+    clean_question = re.sub(r"^[^\w]+", "", label).strip()
+    with cols[idx % 3]:
+        if st.button(label, key=f"quick_{idx}", use_container_width=True):
+            st.session_state.pending_query = clean_question
+
+st.divider()
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.write(msg["content"])
+        st.markdown(msg["content"])
+        if msg.get("faqs"):
+            with st.expander("📚 Related Store FAQ References"):
+                for idx, faq in enumerate(msg["faqs"], start=1):
+                    st.markdown(f"**{idx}. {faq.get('question', '')}**")
+                    st.caption(faq.get("answer", ""))
 
-st.write("Try a quick question:")
-cols = st.columns(3)
-for idx, question in enumerate(quick_questions):
-    with cols[idx % 3]:
-        if st.button(question, key=f"quick_{idx}", use_container_width=True):
-            st.session_state.pending_query = question
-
-chat_input_query = st.chat_input("Ask a question about store policies...")
+chat_input_query = st.chat_input("Ask a question about orders, policies, or anything else...")
 user_query = st.session_state.pending_query or chat_input_query
 if st.session_state.pending_query:
     st.session_state.pending_query = None
@@ -158,69 +327,69 @@ if st.session_state.pending_query:
 if user_query:
     st.session_state.messages.append({"role": "user", "content": user_query})
     with st.chat_message("user"):
-        st.write(user_query)
+        st.markdown(user_query)
 
-    greeting_reply = get_greeting_response(user_query)
-    direct_faq = find_direct_faq(user_query, faq_entries)
-    relevant_faqs = [direct_faq] if direct_faq else retrieve_relevant_faqs(user_query, faq_entries)
+    relevant_faqs = retrieve_relevant_faqs(user_query, faq_entries)
+    norm_key = normalize_text(user_query)
 
-    if greeting_reply:
-        bot_reply = greeting_reply
+    if not api_key:
+        bot_reply = generate_fallback_reply(user_query, relevant_faqs)
         with st.chat_message("assistant"):
-            st.write(bot_reply)
-    elif direct_faq:
-        bot_reply = direct_faq["answer"]
+            st.warning("GEMINI_API_KEY is missing from `.env`. Showing fallback response:")
+            st.markdown(bot_reply)
+    elif norm_key in st.session_state.response_cache:
+        bot_reply = st.session_state.response_cache[norm_key]
         with st.chat_message("assistant"):
-            st.write(bot_reply)
-    elif not api_key:
-        bot_reply = "I can’t answer that right now because GEMINI_API_KEY is missing. Check your .env file."
-        with st.chat_message("assistant"):
-            st.error(bot_reply)
+            st.markdown(bot_reply)
+            if relevant_faqs:
+                with st.expander("📚 Related Store FAQ References"):
+                    for idx, faq in enumerate(relevant_faqs, start=1):
+                        st.markdown(f"**{idx}. {faq.get('question', '')}**")
+                        st.caption(faq.get("answer", ""))
     else:
-        faq_context = "\n\n".join(
-            f"FAQ {idx + 1}: Q: {faq.get('question', '')}\nA: {faq.get('answer', '')}"
-            for idx, faq in enumerate(relevant_faqs)
-        ) or "No directly relevant FAQ entries were found for this question."
-
-        system_prompt = (
-            "You are an official customer support assistant for an online store. "
-            "Answer the customer question using only the relevant FAQ entries below. "
-            "If the customer asks something outside the FAQ, politely explain that the answer is not available "
-            "in the knowledge base and recommend contacting human support at "
-            f"{SUPPORT_EMAIL}. Do not invent facts, policies, discounts, or shipping promises.\n\n"
-            f"RELEVANT FAQ ENTRIES:\n{faq_context}"
+        system_instruction, user_contents = build_fast_prompt(
+            relevant_faqs, st.session_state.messages, user_query
         )
-        full_prompt = f"{system_prompt}\n\nCustomer Question: {user_query}\nSupport Answer:"
 
         try:
-            client = get_client()
-            response_stream = client.models.generate_content_stream(
-                model="gemini-3.8-flash",
-                contents=full_prompt,
-            )
-
+            client = get_client(api_key)
             answer_parts = []
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
+                message_placeholder.markdown("⚡ *Generating answer...*")
+                response_stream = stream_gemini_response(
+                    client, system_instruction, user_contents
+                )
                 for chunk in response_stream:
-                    if getattr(chunk, "text", None):
-                        answer_parts.append(chunk.text)
-                        message_placeholder.write("".join(answer_parts))
+                    chunk_text = getattr(chunk, "text", None)
+                    if chunk_text:
+                        answer_parts.append(chunk_text)
+                        message_placeholder.markdown("".join(answer_parts) + " ▌")
 
                 bot_reply = "".join(answer_parts).strip()
                 if not bot_reply:
-                    bot_reply = "I couldn’t generate an answer right now. Please try again."
-                    st.error(bot_reply)
-        except APIError as error:
-            bot_reply = "I couldn’t get an answer just now. Please try again."
+                    bot_reply = generate_fallback_reply(user_query, relevant_faqs)
+
+                if SUPPORT_EMAIL.lower() not in bot_reply.lower():
+                    bot_reply += (
+                        f"\n\n💡 *For any extra questions, feel free to contact us at **{SUPPORT_EMAIL}**.*"
+                    )
+
+                message_placeholder.markdown(bot_reply)
+                st.session_state.response_cache[norm_key] = bot_reply
+
+                if relevant_faqs:
+                    with st.expander("📚 Related Store FAQ References"):
+                        for idx, faq in enumerate(relevant_faqs, start=1):
+                            st.markdown(f"**{idx}. {faq.get('question', '')}**")
+                            st.caption(faq.get("answer", ""))
+
+        except Exception as error:
+            bot_reply = generate_fallback_reply(user_query, relevant_faqs)
             with st.chat_message("assistant"):
-                st.error(f"Gemini request failed: {error}")
-                st.write(bot_reply)
+                st.markdown(bot_reply)
+                st.caption(f"*(Note: Live AI response unavailable right now: {error})*")
 
-    if relevant_faqs:
-        with st.expander("Relevant FAQ references"):
-            for idx, faq in enumerate(relevant_faqs, start=1):
-                st.markdown(f"**{idx}.** {faq.get('question', '')}")
-                st.write(faq.get('answer', ''))
-
-    st.session_state.messages.append({"role": "assistant", "content": bot_reply})
+    st.session_state.messages.append(
+        {"role": "assistant", "content": bot_reply, "faqs": relevant_faqs}
+    )
